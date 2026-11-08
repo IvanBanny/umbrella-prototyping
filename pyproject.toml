@@ -1,0 +1,17 @@
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.mypy]
+python_version = "3.9"
+check_untyped_defs = true
+disallow_untyped_defs = true
+# all launcher imports are from the standard library or this repo
+# skip looking for a separate Python 3.9 installation on Windows
+no_site_packages = true

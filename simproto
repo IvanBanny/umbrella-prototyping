@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""Runs Isaac Sim and Isaac Lab on Umbrella."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime
+import json
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tarfile
+import time
+import uuid
+
+import desktop
+import relay
+import scheduler
+
+SOURCE = pathlib.Path(__file__).resolve().parent
+ROOT = (
+    pathlib.Path(os.environ.get("SIMPROTO_ROOT", "~/simproto")).expanduser().resolve()
+)
+FILES = (
+    "README.md",
+    "simproto",
+    "scheduler.py",
+    "runtime.py",
+    "relay.py",
+    "desktop.py",
+    "smoke.py",
+    "probe.sh",
+    "setup.sh",
+    "third_party/nvenc-gpu-filter",
+)
+
+
+def sessions() -> pathlib.Path:
+    """Returns the directory holding session files."""
+    return ROOT / "runs"
+
+
+def session_path(name: str) -> pathlib.Path:
+    """Finds a session by full ID or unique suffix within the runs directory."""
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
+        raise ValueError("Use a session ID printed by start or status")
+    path = sessions() / name
+    if (path / "request.json").is_file():
+        return path
+    matches = sorted(p.parent for p in sessions().glob(f"*-{name}/request.json"))
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        names = ", ".join(path.name for path in matches)
+        raise ValueError(f"Ambiguous session {name}; use a full ID: {names}")
+    raise ValueError(f"Unknown session: {name}")
+
+
+def session_id(session: pathlib.Path) -> str:
+    """Returns the short ID if it identifies this session uniquely."""
+    short = session.name.rsplit("-", 1)[-1]
+    try:
+        if session_path(short) == session:
+            return short
+    except ValueError:
+        pass
+    return session.name
+
+
+def select_session(
+    name: str | None,
+    gui: bool = False,
+    recent: bool = False,
+) -> pathlib.Path:
+    """Selects an active session, allowing the latest finished session for logs."""
+    if name is not None:
+        return session_path(name)
+    paths = sorted(p.parent for p in sessions().glob("*/request.json"))
+    if gui:
+        paths = [
+            p
+            for p in paths
+            if json.loads((p / "request.json").read_text()).get("mode") == "gui"
+        ]
+    active = [
+        p for p in paths if not (p / "exit.code").exists() and not (p / "stop").exists()
+    ]
+    if len(active) == 1:
+        return active[0]
+    if active:
+        labels = ", ".join(session_id(p) for p in active)
+        raise ValueError(f"Several sessions are active; choose one: {labels}")
+    if recent and paths:
+        return paths[-1]
+    raise ValueError("No active session. Run start first")
+
+
+def endpoint(session: pathlib.Path, wait: bool = False) -> dict:
+    """Reads the editor connection settings once Isaac has loaded."""
+    if json.loads((session / "request.json").read_text()).get("mode") != "gui":
+        raise ValueError("Only GUI sessions have a streaming connection")
+    previous = ""
+    while True:
+        if (session / "exit.code").exists() or (session / "stop").exists():
+            raise ValueError(
+                "This session has ended. Check logs before starting another"
+            )
+        log_path = session / "launcher.log"
+        log = log_path.read_text(errors="replace") if log_path.exists() else ""
+        if "cudaErrorIllegalAddress" in log or "Simulation cannot continue!" in log:
+            raise RuntimeError(
+                f"Session {session_id(session)} has a GPU error and needs restarting. "
+                "Check logs, then stop it and start a new session."
+            )
+        connection = session / "connection.json"
+        allocated = jobs(session)
+        if connection.is_file() and allocated and "App is loaded." in log:
+            return json.loads(connection.read_text())
+        if not allocated and (session / "job.id").exists():
+            raise ValueError("The streaming allocation has ended. Check logs")
+        message = (
+            "Starting Isaac..." if allocated else "Waiting for a GPU allocation..."
+        )
+        if not wait:
+            raise ValueError(message + " Use connect to wait until it is ready")
+        if message != previous:
+            print(message, file=sys.stderr, flush=True)
+            previous = message
+        time.sleep(3)
+
+
+def jobs(session: pathlib.Path) -> list[str]:
+    """Finds this user's jobs with the session's exact Slurm comment."""
+    result = scheduler.command(["squeue", "-h", "-u", str(os.getuid()), "-o", "%i|%k"])
+    result.check_returncode()
+    return [
+        line.split("|", 1)[0]
+        for line in result.stdout.splitlines()
+        if line.split("|", 1)[-1] == f"simproto:{session.name}"
+    ]
+
+
+def stop_session(session: pathlib.Path) -> None:
+    """Stops the controller and cancels the session's jobs, keeping its files."""
+    (session / "stop").touch()
+    # stop the controller before querying jobs so it cannot submit another one
+    try:
+        pid = int((session / "controller.pid").read_text())
+        process_arguments = (
+            pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        )
+        if (
+            str(ROOT / "simproto").encode() in process_arguments
+            and session.name.encode() in process_arguments
+            and b"_work" in process_arguments
+        ):
+            os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, FileNotFoundError):
+        pass
+    for job in jobs(session):
+        subprocess.run(["scancel", job], check=True)
+    print(f"Stopped {session_id(session)}; outputs remain in {session}")
+
+
+def stop_all() -> int:
+    """Stops all active sessions under this simproto installation."""
+    stopped = 0
+    failed = False
+    for request in sorted(sessions().glob("*/request.json")):
+        session = request.parent
+        try:
+            ended = (session / "exit.code").exists() or (session / "stop").exists()
+            if ended and not jobs(session):
+                continue
+            stop_session(session)
+            stopped += 1
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            print(f"simproto: could not stop {session.name}: {error}", file=sys.stderr)
+            failed = True
+    if not stopped and not failed:
+        print("No active simproto sessions")
+    return int(failed)
+
+
+def worker(session: pathlib.Path) -> int:
+    """Tries available nodes, then queues on the best remaining candidate."""
+    config = json.loads((session / "request.json").read_text())
+    request = scheduler.Request(
+        **{k: config[k] for k in dataclasses.asdict(scheduler.Request())}
+    )
+    candidates = scheduler.inspect(request)
+    scheduler.describe(candidates)
+    if not candidates:
+        raise RuntimeError("No accessible node can satisfy this request")
+    env = os.environ.copy()
+    env["SLURM_EXIT_IMMEDIATE"] = "75"
+    env["SLURM_EXIT_ERROR"] = "76"
+    # inherited Slurm options can override our request or nest allocations
+    for key in list(env):
+        if key.startswith(("SBATCH_", "SALLOC_", "SRUN_")):
+            del env[key]
+
+    def launch(candidate: scheduler.Candidate, immediate: bool) -> int:
+        if (session / "stop").exists():
+            return 0
+        print(
+            f"{'Trying now' if immediate else 'Queueing'}: {candidate.target.name}",
+            flush=True,
+        )
+        args = [
+            "srun",
+            *candidate.target.options(request),
+            "--job-name=simproto-" + config["mode"],
+            f"--comment=simproto:{session.name}",
+        ]
+        if immediate:
+            args.append("--immediate=1")
+        args += ["python3", str(ROOT / "runtime.py"), str(session)]
+        return subprocess.call(args, env=env)
+
+    for candidate in candidates:
+        if not candidate.immediate:
+            continue
+        code = launch(candidate, True)
+        # retry only allocation failures; the application may have written results
+        if (session / "job.id").exists() or code == 0:
+            return code
+        if code != 75:
+            raise RuntimeError(f"Allocation failed with status {code}; inspect the log")
+        if jobs(session):
+            raise RuntimeError("An allocation still exists; refusing to start another")
+    if (session / "stop").exists():
+        return 0
+    return launch(min(candidates, key=lambda c: c.rank()), False)
+
+
+def resource_options(parser: argparse.ArgumentParser) -> None:
+    """Adds the resource options used by plan and start."""
+    parser.add_argument(
+        "--gpu", choices=("auto", "l4", "l4-4", "l4-8", "2080ti"), default="auto"
+    )
+    parser.add_argument("--gpus", type=int, default=1)
+    parser.add_argument("--cpus", type=int, default=4)
+    parser.add_argument("--mem", default="32G")
+    parser.add_argument("--time", default="02:00:00")
+
+
+def parser() -> argparse.ArgumentParser:
+    """Builds the command-line parser."""
+    result = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    result.add_argument("--host", default=os.environ.get("SIMPROTO_HOST", "ugpu"))
+    result.add_argument("--remote", action="store_true", help=argparse.SUPPRESS)
+    result.add_argument(
+        "--client-command", default="./simproto", help=argparse.SUPPRESS
+    )
+    commands = result.add_subparsers(dest="action", required=True)
+    commands.add_parser("install", help="Copy the launcher to Umbrella")
+    commands.add_parser("setup", help="Build the Isaac container in a CPU job")
+    resource_options(
+        commands.add_parser(
+            "plan", help="Check capacity and start estimates without allocating"
+        )
+    )
+    start = commands.add_parser("start", help="Start an editor or headless job")
+    resource_options(start)
+    start.add_argument(
+        "--mode", choices=("gui", "check", "run", "probe"), default="gui"
+    )
+    start.add_argument("--project", default=str(ROOT / "project"))
+    start.add_argument(
+        "--direct",
+        action="store_true",
+        help="Connect directly to the compute node (requires TCP and UDP access)",
+    )
+    start.add_argument("command", nargs=argparse.REMAINDER)
+    start.add_argument(
+        "--detach", action="store_true", help="Submit without connecting"
+    )
+    start.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    start.add_argument("--no-client", action="store_true", help="Open only the tunnel")
+    start.add_argument("--local-port", type=int, default=49100)
+    commands.add_parser("status", help="Show sessions and scheduler state")
+    for name in ("logs", "connect"):
+        sub = commands.add_parser(name)
+        sub.add_argument(
+            "session", nargs="?", help="Full or short ID; usually optional"
+        )
+        if name == "logs":
+            sub.add_argument("--follow", action="store_true")
+        if name == "connect":
+            sub.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+            sub.add_argument("--local-port", type=int, default=49100)
+            sub.add_argument(
+                "--no-client", action="store_true", help="Open only the tunnel"
+            )
+            sub.add_argument("--wait", action="store_true", help=argparse.SUPPRESS)
+    stop = commands.add_parser("stop", help="Stop one session, or all your sessions")
+    stop.add_argument(
+        "session", nargs="?", help="Full or short session ID; omit to stop all"
+    )
+    internal = commands.add_parser("_work", help=argparse.SUPPRESS)
+    internal.add_argument("session")
+    return result
+
+
+def client_command(host: str) -> str:
+    """Formats commands with the Python interpreter running this launcher."""
+    arguments = [sys.executable, str(SOURCE / "simproto"), "--host", host]
+    if sys.platform == "win32":
+        # PowerShell needs & to run a quoted path; single quotes prevent expansion
+        # double embedded apostrophes to keep them literal
+        return "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in arguments)
+    return shlex.join(arguments)
+
+
+def remote(host: str, arguments: list[str]) -> int:
+    """Runs the remote launcher over SSH, quoting each argument."""
+    arguments = ["--client-command=" + client_command(host), *arguments]
+    command = 'exec python3 "$HOME/simproto/simproto" --remote ' + shlex.join(arguments)
+    return subprocess.call(["ssh", "-o", "ConnectTimeout=20", host, command])
+
+
+def remote_json(host: str, arguments: list[str]) -> dict:
+    """Reads JSON from the remote launcher while stderr reports progress."""
+    command = 'exec python3 "$HOME/simproto/simproto" --remote ' + shlex.join(arguments)
+    result = subprocess.run(
+        ["ssh", "-o", "ConnectTimeout=20", host, command],
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode:
+        raise RuntimeError("Remote command failed; see the message above")
+    return json.loads(result.stdout)
+
+
+def connect(
+    host: str,
+    name: str | None,
+    local_port: int,
+    open_client: bool = True,
+) -> int:
+    """Gets the session settings and connects the local client."""
+    if open_client:
+        desktop.executable()
+    arguments = ["connect", "--json", "--wait"]
+    if name:
+        arguments.append(name)
+    connection = remote_json(host, arguments)
+    if connection["direct"]:
+        print(
+            f"Server: {connection['ip']}  Signal: {connection['signal_port']}  "
+            f"Stream: {connection['stream_port']}"
+        )
+        print(f"UDP port {connection['stream_port']} must also be reachable.")
+        if open_client:
+            with desktop.launch(
+                connection["ip"], connection["signal_port"], connection["stream_port"]
+            ) as client:
+                client.wait()
+        return 0
+    return relay.connect(host, connection, local_port, open_client=open_client)
+
+
+def start_desktop(host: str, arguments: list[str], args: argparse.Namespace) -> int:
+    """Starts an editor session and connects when Isaac is ready."""
+    if not args.no_client:
+        desktop.executable()
+    if not args.direct:
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", args.local_port))
+            except OSError:
+                raise RuntimeError(
+                    f"Local port {args.local_port} is already in use. Close the "
+                    "previous tunnel or choose another --local-port before starting."
+                ) from None
+    result = remote_json(host, ["start", "--json", *arguments[1:]])
+    print(f"Session: {result['id']}", flush=True)
+    print("Ctrl+C disconnects; the stop command releases the GPU.", flush=True)
+    return connect(host, result["session"], args.local_port, not args.no_client)
+
+
+def install_member(member: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Sets archive permissions explicitly so Windows installs work on Linux."""
+    member.mode = 0o700 if member.isdir() or member.name == "simproto" else 0o600
+    if member.name.endswith(".sh"):
+        member.mode = 0o700
+    return member
+
+
+def remote_arguments(arguments: list[str]) -> list[str]:
+    """Strips the launcher's host option before forwarding the command."""
+    while arguments:
+        if arguments[0] == "--host":
+            arguments = arguments[2:]
+        elif arguments[0].startswith("--host="):
+            arguments = arguments[1:]
+        else:
+            break
+    return arguments
+
+
+def main() -> int:
+    """Runs the requested launcher command."""
+    os.umask(0o077)
+    args = parser().parse_args()
+    if args.remote and os.name == "nt":
+        raise ValueError("--remote is for the Linux Umbrella host; omit it locally")
+    if args.action == "install":
+        command = (
+            'umask 077; mkdir -p "$HOME/simproto" && tar -xf - -C "$HOME/simproto"'
+        )
+        process = subprocess.Popen(["ssh", args.host, command], stdin=subprocess.PIPE)
+        assert process.stdin is not None
+        with tarfile.open(fileobj=process.stdin, mode="w|") as archive:
+            for name in FILES:
+                archive.add(SOURCE / name, arcname=name, filter=install_member)
+        process.stdin.close()
+        code = process.wait()
+        if not code:
+            print(f"Installed on {args.host}. Next: {client_command(args.host)} setup")
+        return code
+    if not args.remote and (os.name == "nt" or not shutil.which("sinfo")):
+        if args.action == "connect":
+            return connect(args.host, args.session, args.local_port, not args.no_client)
+        arguments = remote_arguments(sys.argv[1:])
+        if args.action == "start" and args.mode == "gui" and not args.detach:
+            return start_desktop(args.host, arguments, args)
+        return remote(args.host, arguments)
+    if args.action == "setup":
+        sessions().mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [
+                "sbatch",
+                "--parsable",
+                "--partition=tue.default.q",
+                "--nodes=1",
+                "--ntasks=1",
+                "--cpus-per-task=4",
+                "--mem=32G",
+                "--time=01:00:00",
+                "--job-name=simproto-setup",
+                "--no-requeue",
+                f"--output={sessions()}/setup-%j.log",
+                str(ROOT / "setup.sh"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        print(result.stdout or result.stderr, end="", flush=True)
+        return result.returncode
+    if args.action in ("plan", "start"):
+        request = scheduler.Request(
+            args.gpu, args.gpus, args.cpus, args.mem.upper(), args.time
+        )
+        if min(request.gpus, request.cpus) < 1:
+            raise ValueError("GPU and CPU counts must be positive")
+        request.memory_mib
+        if not re.fullmatch(r"(?:\d+-)?\d{1,3}:\d{2}:\d{2}", request.time):
+            raise ValueError("Use HH:MM:SS or D-HH:MM:SS for --time")
+        if args.action == "plan":
+            candidates = scheduler.inspect(request)
+            scheduler.describe(candidates)
+            if not candidates:
+                return 1
+            available = [c for c in candidates if c.immediate]
+            selected = (
+                available[0] if available else min(candidates, key=lambda c: c.rank())
+            )
+            print(
+                f"First choice: {selected.target.name}; Slurm makes the final decision"
+            )
+            return 0
+        if os.environ.get("SLURM_JOB_ID"):
+            raise ValueError(
+                "Start sessions from the login node, outside another allocation"
+            )
+        if args.mode != "probe" and not (ROOT / "images/isaac-lab-3.0.0.sif").is_file():
+            raise ValueError(
+                "The image is missing. Run setup and wait for it to finish"
+            )
+        app_command = args.command[1:] if args.command[:1] == ["--"] else args.command
+        if args.mode == "run" and not app_command:
+            raise ValueError("run mode requires a command after --")
+        if args.mode != "run" and app_command:
+            raise ValueError("Commands after -- require --mode run")
+        project = pathlib.Path(args.project).expanduser().resolve()
+        if project == ROOT / "project":
+            project.mkdir(parents=True, exist_ok=True)
+        if not project.is_dir():
+            raise ValueError(f"Remote project directory does not exist: {project}")
+        name = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+        session = sessions() / name
+        session.mkdir(parents=True)
+        config = {
+            **dataclasses.asdict(request),
+            "mode": args.mode,
+            "project": str(project),
+            "command": app_command,
+            "direct": args.direct,
+        }
+        (session / "request.json").write_text(json.dumps(config, indent=2))
+        with (session / "launcher.log").open("w") as log:
+            process = subprocess.Popen(
+                ["python3", str(ROOT / "simproto"), "--remote", "_work", name],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+            )
+        (session / "controller.pid").write_text(str(process.pid))
+        label = session_id(session)
+        if args.json:
+            print(json.dumps({"session": name, "id": label}))
+            return 0
+        print(
+            f"Session: {label}\n{args.client_command} logs {label} --follow\n"
+            f"{args.client_command} connect {label}"
+        )
+        return 0
+    if args.action == "_work":
+        session = session_path(args.session)
+        code = 1
+        try:
+            code = worker(session)
+            return code
+        finally:
+            (session / "exit.code").write_text(str(code))
+    if args.action == "status":
+        result = subprocess.run(
+            ["squeue", "-u", str(os.getuid()), "-o", "%.18i %.20j %.12T %.24N %R"],
+            text=True,
+        )
+        for session in sorted(sessions().glob("*/request.json"))[-20:]:
+            path = session.parent
+            status = "stopped" if (path / "stop").exists() else "waiting/running"
+            if (path / "exit.code").exists():
+                status = "exit " + (path / "exit.code").read_text()
+            job = (path / "job.id").read_text() if (path / "job.id").exists() else "-"
+            print(f"{session_id(path)} job={job} {status}")
+        return result.returncode
+    if args.action == "stop" and args.session is None:
+        return stop_all()
+    session = select_session(
+        args.session, gui=args.action == "connect", recent=args.action == "logs"
+    )
+    if args.action == "logs":
+        return subprocess.call(
+            [
+                "tail",
+                "-n",
+                "60",
+                *(["-f"] if args.follow else []),
+                str(session / "launcher.log"),
+            ]
+        )
+    if args.action == "connect":
+        print(json.dumps(endpoint(session, wait=args.wait)))
+        if not args.json:
+            print(
+                f"Run {args.client_command} connect {session_id(session)} "
+                "on your own machine to open the tunnel."
+            )
+            print("Check logs for the loaded message before connecting the client.")
+        return 0
+    if args.action == "stop":
+        stop_session(session)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        entrypoint = ".\\simproto.cmd" if sys.platform == "win32" else "./simproto"
+        print(
+            f"\nDisconnected. Use {entrypoint} connect to return or "
+            f"{entrypoint} stop to release the GPU.",
+            file=sys.stderr,
+        )
+        sys.exit(130)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"simproto: {error}", file=sys.stderr)
+        sys.exit(1)

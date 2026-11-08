@@ -1,0 +1,33 @@
+name: Checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install ruff==0.17.4 mypy==1.15.0
+      - run: ruff format --check . simproto
+      - run: ruff check . simproto
+      # type-check the cluster runtime as Linux on every runner
+      - run: mypy --platform linux simproto scheduler.py runtime.py relay.py desktop.py
+      - run: python -m unittest discover -s tests
+      - run: bash -n setup.sh probe.sh
+        if: runner.os == 'Linux'
+      - name: Check the NVENC filter
+        if: runner.os == 'Linux'
+        run: |
+          cc -DNVENC_FILTER_TEST -o /tmp/simproto-nvenc-test third_party/nvenc-gpu-filter/nvenc-gpu-filter.c -lpthread
+          /tmp/simproto-nvenc-test
+          rm /tmp/simproto-nvenc-test
